@@ -1,0 +1,35 @@
+name = "pont-pdf"
+main = "src_index.js" 
+compatibility_date = "2026-06-27"
+
+# ==============================================================================
+# VARIABLES D'ENVIRONNEMENT NON SENSIBLES
+# ==============================================================================
+[vars]
+FIREBASE_PROJECT_ID = "lt-coaching"
+
+# ==============================================================================
+# STOCKAGE CLOUDFLARE R2 (STOCKAGE DES FICHIERS PDF)
+# ==============================================================================
+[[r2_buckets]]
+binding = "MON_BUCKET"
+bucket_name = "ma-bibliotheque-fichiers"
+
+# ==============================================================================
+# BASE DE DONNÉES CLOUDFLARE D1
+# ==============================================================================
+[[d1_databases]]
+binding = "DB"
+database_name = "lt-coaching-db"
+database_id = "4af47fa6-a8c4-4433-a27d-90e62aa61b8a"
+
+# ==============================================================================
+# DECLENCHEUR AUTOMATIQUE CRON (REVERSEMENT MENSUREL AUX AUTEURS)
+# S'exécute le 15 de chaque mois à 23h59 UTC
+# ==============================================================================
+[triggers]
+crons = ["59 23 15 * *"]
+
+[observability.logs]
+enabled = false
+invocation_logs = true
