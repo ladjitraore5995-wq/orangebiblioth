@@ -1,5 +1,5 @@
 name = "bibli"
-main = "src_index.js" 
+main = "index.js" # Remplacez par "src/index.js" si votre code est dans un dossier "src"
 compatibility_date = "2026-06-27"
 
 # ==============================================================================
@@ -9,7 +9,7 @@ compatibility_date = "2026-06-27"
 FIREBASE_PROJECT_ID = "lt-coaching"
 
 # ==============================================================================
-# STOCKAGE CLOUDFLARE R2 (STOCKAGE DES FICHIERS PDF)
+# BUCKET R2 (STOCKAGE DES FICHIERS PDF)
 # ==============================================================================
 [[r2_buckets]]
 binding = "MON_BUCKET"
@@ -24,8 +24,7 @@ database_name = "lt-coaching-db"
 database_id = "4af47fa6-a8c4-4433-a27d-90e62aa61b8a"
 
 # ==============================================================================
-# DECLENCHEUR AUTOMATIQUE CRON (REVERSEMENT MENSUREL AUX AUTEURS)
-# S'exécute le 15 de chaque mois à 23h59 UTC
+# DÉCLENCHEUR CRON (REVERSEMENT AUTOMATIQUE LE 15 DU MOIS À 23H59)
 # ==============================================================================
 [triggers]
 crons = ["59 23 15 * *"]
