@@ -1,5 +1,5 @@
 name = "bibli"
-main = "index.js" # Remplacez par "src/index.js" si votre code est dans un dossier "src"
+main = "scr_index.js" # Remplacez par "src/index.js" si votre code est dans un dossier "src"
 compatibility_date = "2026-06-27"
 
 # ==============================================================================
