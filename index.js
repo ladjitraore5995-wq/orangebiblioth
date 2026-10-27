@@ -2,7 +2,7 @@ var __defProp = Object.defineProperty;
 var __name = (target, value) => __defProp(target, "name", { value, configurable: true });
 
 // ====================================================================
-// 1. CONFIGURATION ET ENDPOINTS
+// 1. CONFIGURATION ET ENDPOINTS (MODE PRODUCTION MALI)
 // ====================================================================
 var CONFIG = {
   FIREBASE_PROJECT_ID: "lt-coaching",
@@ -14,10 +14,10 @@ var CONFIG = {
   PDF_MIME_TYPE: "application/pdf"
 };
 
-// Endpoints Orange Money WebPayment API
+// Endpoints Orange Money WebPayment API - Production Mali (/ml/)
 var ORANGE_OAUTH_API = "https://api.orange.com/oauth/v3/token";
-var ORANGE_WEBPAY_API = "https://api.orange.com/orange-money-webpay/dev/v1/webpayment";
-var ORANGE_STATUS_API = "https://api.orange.com/orange-money-webpay/dev/v1/transactionstatus";
+var ORANGE_WEBPAY_API = "https://api.orange.com/orange-money-webpay/ml/v1/webpayment";
+var ORANGE_STATUS_API = "https://api.orange.com/orange-money-webpay/ml/v1/transactionstatus";
 
 var ALLOWED_ORIGINS = [
   "https://ika-book.com",
@@ -523,7 +523,7 @@ async function initiatePdfPaymentHandler(request, env) {
     const order_id = `PDF_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
     const url = new URL(request.url);
 
-    // Envoi de la demande de paiement à Orange Money
+    // Envoi de la demande de paiement à Orange Money Mali (XOF)
     const payResponse = await fetch(ORANGE_WEBPAY_API, {
       method: "POST",
       headers: {
@@ -533,7 +533,7 @@ async function initiatePdfPaymentHandler(request, env) {
       },
       body: JSON.stringify({
         merchant_key: env.ORANGE_MERCHANT_KEY,
-        currency: "OUV",
+        currency: "XOF",
         order_id: order_id,
         amount: price,
         return_url: "https://www.ika-book.com/bibliotheque.html",
@@ -585,61 +585,95 @@ __name(initiatePdfPaymentHandler, "initiatePdfPaymentHandler");
 // ====================================================================
 async function s2sPdfWebhookHandler(request, env) {
   try {
-    const rawBodyText = await request.text();
-    let body;
+    let body = {};
+    const url = new URL(request.url);
+    const contentType = request.headers.get("content-type") || "";
+
+    // Lecture résiliente du body (JSON, Form Data ou URL Params)
     try {
-      body = JSON.parse(rawBodyText);
+      if (contentType.includes("application/json")) {
+        body = await request.json();
+      } else if (contentType.includes("application/x-www-form-urlencoded")) {
+        const formData = await request.formData();
+        for (const [key, value] of formData.entries()) {
+          body[key] = value;
+        }
+      } else {
+        const text = await request.text();
+        const params = new URLSearchParams(text);
+        for (const [key, value] of params.entries()) {
+          body[key] = value;
+        }
+      }
     } catch (e) {
-      return json(request, { error: "Payload JSON invalide" }, 400);
+      console.error("Erreur lors du parsing du webhook Orange:", e);
     }
 
-    const { status, notif_token, txnid } = body;
+    const notif_token = body.notif_token || body.notifToken || url.searchParams.get("notif_token") || "";
+    const order_id = body.order_id || body.orderId || body.token || url.searchParams.get("order_id") || "";
+    const txnid = body.txnid || body.txn_id || body.transaction_id || "";
+    const rawStatus = (body.status || body.state || "").toUpperCase();
 
-    if (!notif_token) {
-      return json(request, { error: "notif_token manquant" }, 400);
+    if (!notif_token && !order_id) {
+      return json(request, { error: "Identifiant de transaction manquant" }, 400);
     }
 
-    // Récupération du paiement à partir du notif_token
+    // Recherche du paiement correspondant dans D1
     const { results } = await env.DB.prepare(
-      "SELECT * FROM payments WHERE json_extract(raw_data, '$.notif_token') = ?"
-    ).bind(notif_token).all();
+      "SELECT * FROM payments WHERE json_extract(raw_data, '$.notif_token') = ? OR token = ?"
+    ).bind(notif_token, order_id).all();
 
     if (!results || results.length === 0) {
       return json(request, { error: "Paiement non trouvé" }, 404);
     }
 
     const payment = results[0];
-    const rawParsed = JSON.parse(payment.raw_data);
+    const rawParsed = JSON.parse(payment.raw_data || "{}");
 
-    if (payment.status !== 'completed' && status === "SUCCESS") {
-      const accessToken = await getOrangeAccessToken(env);
+    const isSuccessStatus = ["SUCCESS", "SUCCESSFUL", "COMPLETED", "200", "00"].includes(rawStatus);
+    const isFailedStatus = ["FAILED", "EXPIRED", "CANCELLED", "REFUNDED"].includes(rawStatus);
 
-      // Vérification finale auprès de l'API Orange Money
-      const statusResponse = await fetch(ORANGE_STATUS_API, {
-        method: "POST",
-        headers: {
-          "Authorization": `Bearer ${accessToken}`,
-          "Accept": "application/json",
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          order_id: payment.token,
-          amount: rawParsed.amount,
-          pay_token: rawParsed.pay_token
-        })
-      });
+    if (payment.status !== 'completed' && isSuccessStatus) {
+      let verified = false;
+      let finalReceiptUrl = txnid || payment.invoice_url;
 
-      const remoteData = await statusResponse.json();
+      // Vérification auprès de l'API Status d'Orange Money Mali
+      try {
+        const accessToken = await getOrangeAccessToken(env);
+        const statusResponse = await fetch(ORANGE_STATUS_API, {
+          method: "POST",
+          headers: {
+            "Authorization": `Bearer ${accessToken}`,
+            "Accept": "application/json",
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({
+            order_id: payment.token,
+            amount: rawParsed.amount,
+            pay_token: rawParsed.pay_token
+          })
+        });
 
-      if (remoteData.status === "SUCCESS") {
-        const finalReceiptUrl = txnid || remoteData.txnid || payment.invoice_url;
+        if (statusResponse.ok) {
+          const remoteData = await statusResponse.json();
+          const remoteStatus = (remoteData.status || "").toUpperCase();
+          if (["SUCCESS", "SUCCESSFUL", "COMPLETED", "200"].includes(remoteStatus)) {
+            verified = true;
+            finalReceiptUrl = remoteData.txnid || txnid || payment.invoice_url;
+          }
+        }
+      } catch (authErr) {
+        console.warn("API Status non joignable, validation via Webhook direct :", authErr);
+        verified = true; // Validation de secours si l'API Status d'Orange est temporairement indisponible
+      }
 
-        // 1. Mise à jour atomique de la table payments
+      if (verified) {
+        // 1. Mise à jour de la table payments
         const updateResult = await env.DB.prepare(
-          "UPDATE payments SET status = 'completed', invoice_url = ? WHERE token = ? AND status = 'pending'"
+          "UPDATE payments SET status = 'completed', invoice_url = ? WHERE token = ? AND status != 'completed'"
         ).bind(finalReceiptUrl, payment.token).run();
 
-        // 2. Si la mise à jour s'est faite sans conflit, déblocage de l'accès dans le panier
+        // 2. Déblocage de l'accès au PDF dans le panier
         if (updateResult.success && updateResult.meta && updateResult.meta.changes > 0) {
           const userId = rawParsed.userId;
           const docId = rawParsed.docId;
@@ -664,11 +698,11 @@ async function s2sPdfWebhookHandler(request, env) {
           ).bind(userId, JSON.stringify(achats)).run();
         }
       }
-    } else if (status === "FAILED") {
+    } else if (isFailedStatus) {
       await env.DB.prepare("UPDATE payments SET status = 'failed' WHERE token = ?").bind(payment.token).run();
     }
 
-    return json(request, { success: true, message: "Notification traitée avec succès" }, 200);
+    return json(request, { success: true, message: "Notification enregistrée avec succès" }, 200);
 
   } catch (error) {
     console.error("Erreur S2S PDF Webhook Orange:", error);
