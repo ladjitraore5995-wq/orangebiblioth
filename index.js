@@ -37,8 +37,16 @@ var encoder = new TextEncoder();
 var decoder = new TextDecoder();
 
 // ====================================================================
-// 2. HELPER RESPONSES & CORS
+// 2. CLASSES D'ERREURS & HELPER RESPONSES (FILTRAGE STRICT)
 // ====================================================================
+class AuthError extends Error {
+  constructor(message = "Authentification requise ou session expirée.") {
+    super(message);
+    this.name = "AuthError";
+  }
+}
+__name(AuthError, "AuthError");
+
 function getCorsHeaders(request) {
   const origin = request?.headers?.get("Origin") || "";
   const allowedOrigin = ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[1];
@@ -64,7 +72,8 @@ function json(request, data, status = 200) {
     status,
     headers: {
       ...getCorsHeaders(request),
-      "Content-Type": "application/json"
+      "Content-Type": "application/json",
+      "X-Content-Type-Options": "nosniff"
     }
   });
 }
@@ -80,24 +89,46 @@ function created(request, data = {}) {
 }
 __name(created, "created");
 
-function badRequest(request, message) {
+function badRequest(request, message = "Requête invalide.") {
   return json(request, { success: false, error: message }, 400);
 }
 __name(badRequest, "badRequest");
 
-function forbidden(request, message) {
+function unauthorized(request, message = "Authentification requise ou session expirée.") {
+  return json(request, { success: false, error: message }, 401);
+}
+__name(unauthorized, "unauthorized");
+
+function forbidden(request, message = "Accès refusé.") {
   return json(request, { success: false, error: message }, 403);
 }
 __name(forbidden, "forbidden");
 
-function notFound(request, message) {
+function notFound(request, message = "Ressource introuvable.") {
   return json(request, { success: false, error: message }, 404);
 }
 __name(notFound, "notFound");
 
+// Filtre centralisé : ne renvoie JAMAIS error.message, stack trace ou erreur SQL au client
 function serverError(request, error) {
-  console.error(error);
-  return json(request, { success: false, error: error.message }, 500);
+  if (error instanceof AuthError) {
+    return unauthorized(request, error.message);
+  }
+
+  console.error("[INTERNAL_SERVER_ERROR]", {
+    name: error?.name || "Error",
+    message: error?.message || String(error),
+    stack: error?.stack || null
+  });
+
+  return json(
+    request,
+    {
+      success: false,
+      error: "Une erreur interne est survenue. Veuillez réessayer ultérieurement."
+    },
+    500
+  );
 }
 __name(serverError, "serverError");
 
@@ -141,16 +172,19 @@ function addMonths(months) {
 __name(addMonths, "addMonths");
 
 function isPdf(file) {
-  return file.type === CONFIG.PDF_MIME_TYPE;
+  return file && file.type === CONFIG.PDF_MIME_TYPE;
 }
 __name(isPdf, "isPdf");
 
 function isValidFileSize(file) {
-  return file.size <= CONFIG.MAX_FILE_SIZE;
+  return file && file.size > 0 && file.size <= CONFIG.MAX_FILE_SIZE;
 }
 __name(isValidFileSize, "isValidFileSize");
 
 async function getMasterKey(secretKey) {
+  if (!secretKey) {
+    throw new Error("APP_SECRET_KEY manquante dans l'environnement.");
+  }
   const hash = await crypto.subtle.digest("SHA-256", encoder.encode(secretKey));
   return crypto.subtle.importKey(
     "raw",
@@ -192,14 +226,14 @@ async function decryptDocumentKey(encryptedKey, secretKey) {
 __name(decryptDocumentKey, "decryptDocumentKey");
 
 // ====================================================================
-// 4. AUTHENTIFICATION FIREBASE JWT
+// 4. AUTHENTIFICATION FIREBASE JWT (VERIFICATION SYSTÉMATIQUE)
 // ====================================================================
 async function getJwks() {
   const now = Date.now();
   if (!cachedJwks || now - cachedJwksTime > CONFIG.JWKS_CACHE_DURATION) {
     const response = await fetch(CONFIG.JWKS_URL);
     if (!response.ok) {
-      throw new Error("Impossible de récupérer les clés Firebase.");
+      throw new Error(`Échec récupération JWKS (${response.status})`);
     }
     cachedJwks = await response.json();
     cachedJwksTime = now;
@@ -210,43 +244,52 @@ __name(getJwks, "getJwks");
 
 async function verifyFirebaseToken(request) {
   const authorization = request.headers.get("Authorization");
-  
-  if (!authorization) {
-    throw new Error("Token d'authentification manquant ou mal formaté.");
+
+  if (!authorization || !authorization.startsWith("Bearer ")) {
+    throw new AuthError("Jeton d'authentification manquant ou invalide.");
   }
-  if (!authorization.startsWith("Bearer ")) {
-    throw new Error("Format du token invalide. Le préfixe 'Bearer ' est requis.");
-  }
-  
-  const token = authorization.substring(7).trim(); 
-  
+
+  const token = authorization.substring(7).trim();
   if (!token || token === "null" || token === "undefined") {
-    throw new Error("Token d'authentification vide ou indéfini.");
+    throw new AuthError("Jeton d'authentification manquant ou invalide.");
   }
 
   const parts = token.split(".");
   if (parts.length !== 3) {
-    throw new Error("JWT invalide ou mal formaté.");
+    throw new AuthError("Jeton d'authentification invalide.");
   }
 
-  const header = JSON.parse(base64UrlDecode(parts[0]));
-  const payload = JSON.parse(base64UrlDecode(parts[1]));
+  let header;
+  let payload;
+  let signatureBytes;
+  try {
+    header = JSON.parse(base64UrlDecode(parts[0]));
+    payload = JSON.parse(base64UrlDecode(parts[1]));
+    signatureBytes = Uint8Array.from(base64UrlDecode(parts[2]), (c) => c.charCodeAt(0));
+  } catch (e) {
+    throw new AuthError("Jeton d'authentification mal formé.");
+  }
+
   const now = Math.floor(Date.now() / 1000);
-  
-  if (payload.exp < now) {
-    throw new Error("Token expiré.");
+  if (typeof payload.exp !== "number" || payload.exp <= now) {
+    throw new AuthError("Session expirée. Veuillez vous reconnecter.");
   }
   if (payload.aud !== CONFIG.FIREBASE_PROJECT_ID) {
-    throw new Error("Audience invalide.");
+    throw new AuthError("Jeton d'authentification non autorisé.");
   }
   if (payload.iss !== `https://securetoken.google.com/${CONFIG.FIREBASE_PROJECT_ID}`) {
-    throw new Error("Émetteur invalide.");
+    throw new AuthError("Jeton d'authentification non autorisé.");
+  }
+
+  const uid = payload.user_id || payload.sub;
+  if (!uid || typeof uid !== "string") {
+    throw new AuthError("Identifiant utilisateur introuvable dans le jeton.");
   }
 
   const jwks = await getJwks();
   const jwk = jwks.keys.find((key) => key.kid === header.kid);
   if (!jwk) {
-    throw new Error("Clé publique introuvable.");
+    throw new AuthError("Signature du jeton impossible à vérifier.");
   }
 
   const publicKey = await crypto.subtle.importKey(
@@ -260,17 +303,17 @@ async function verifyFirebaseToken(request) {
   const valid = await crypto.subtle.verify(
     "RSASSA-PKCS1-v1_5",
     publicKey,
-    Uint8Array.from(base64UrlDecode(parts[2]), (c) => c.charCodeAt(0)),
+    signatureBytes,
     encoder.encode(`${parts[0]}.${parts[1]}`)
   );
 
   if (!valid) {
-    throw new Error("Signature invalide.");
+    throw new AuthError("Signature du jeton invalide.");
   }
 
   return {
-    uid: payload.user_id || payload.sub,
-    email: payload.email,
+    uid,
+    email: payload.email || null,
     payload
   };
 }
@@ -308,11 +351,13 @@ async function getOrangeAccessToken(env) {
   try {
     tokenData = JSON.parse(responseText);
   } catch (e) {
-    throw new Error(`Orange API a renvoyé un format non-JSON : ${responseText}`);
+    console.error("[ORANGE_OAUTH_NON_JSON]", responseText);
+    throw new Error("Réponse invalide du prestataire de paiement.");
   }
 
   if (!tokenData.access_token) {
-    throw new Error(`Échec d'obtention du jeton Orange Money: ${responseText}`);
+    console.error("[ORANGE_OAUTH_FAILED]", { status: tokenResponse.status, body: responseText });
+    throw new Error("Impossible d'initialiser la session de paiement.");
   }
 
   return tokenData.access_token;
@@ -348,8 +393,8 @@ async function saveDocument(env, document) {
       secretAuthorPhone, secretMobileMoneyOperator, dateCreation, encryptedKey, userId
     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
-    document.id, document.title, document.author, document.type, 
-    document.price, document.brutPrice, document.fileName, 
+    document.id, document.title, document.author, document.type,
+    document.price, document.brutPrice, document.fileName,
     document.phone, document.operator, document.dateCreation, document.encryptedKey, document.userId
   ).run();
 }
@@ -370,42 +415,55 @@ async function getDocumentsHandler(request, env) {
 }
 __name(getDocumentsHandler, "getDocumentsHandler");
 
-async function uploadHandler(request, env) {
+async function uploadHandler(request, env, user) {
   try {
-    const user = await verifyFirebaseToken(request);
     const formData = await request.formData();
     const file = formData.get("file");
-    
-    if (!file) return badRequest(request, "Fichier manquant.");
-    if (!isPdf(file)) return badRequest(request, "Seuls les PDF sont autorisés.");
-    if (!isValidFileSize(file)) return badRequest(request, "Le fichier est trop volumineux.");
-    const documentKey = formData.get("documentKey");
+
+    if (!file || typeof file === "string") return badRequest(request, "Fichier manquant.");
+    if (!isPdf(file)) return badRequest(request, "Seuls les fichiers PDF sont autorisés.");
+    if (!isValidFileSize(file)) return badRequest(request, "La taille du fichier dépasse la limite autorisée.");
+
+    const documentKey = String(formData.get("documentKey") || "").trim();
+    const title = String(formData.get("title") || "").trim();
+    const author = String(formData.get("author") || "").trim();
+    const type = String(formData.get("type") || "").trim();
+    const price = String(formData.get("price") || "").trim();
+    const brutPrice = String(formData.get("brutPrice") || "0").trim();
+    const phone = String(formData.get("phone") || "").trim();
+    const operator = String(formData.get("operator") || "").trim();
+
     if (!documentKey) return badRequest(request, "Clé du document manquante.");
+    if (!title || !author) return badRequest(request, "Le titre et l'auteur sont obligatoires.");
+    if (!["gratuit", "payant"].includes(type)) return badRequest(request, "Régime d'accès invalide.");
+    if (type === "payant" && (!phone || Number(brutPrice) <= 0)) {
+      return badRequest(request, "Le prix et le numéro Mobile Money sont obligatoires pour un document payant.");
+    }
 
     const documentId = generateDocumentId();
     const fileName = generateFileName(documentId);
-    
+
     await env.MON_BUCKET.put(fileName, await file.arrayBuffer(), {
-      httpMetadata: { contentType: file.type }
+      httpMetadata: { contentType: CONFIG.PDF_MIME_TYPE }
     });
-    
+
     const encryptedKey = await encryptDocumentKey(documentKey, env.APP_SECRET_KEY);
-    
+
     await saveDocument(env, {
       id: documentId,
-      title: formData.get("title"),
-      author: formData.get("author"),
-      type: formData.get("type"),
-      price: formData.get("price"),
-      brutPrice: formData.get("brutPrice"),
-      phone: formData.get("phone"),
-      operator: formData.get("operator"),
+      title,
+      author,
+      type,
+      price: type === "payant" ? price : "Gratuit",
+      brutPrice: type === "payant" ? brutPrice : "0",
+      phone: type === "payant" ? phone : "",
+      operator: type === "payant" ? operator : "",
       fileName,
       encryptedKey,
-      dateCreation: (new Date()).toISOString(),
-      userId: user.uid 
+      dateCreation: new Date().toISOString(),
+      userId: user.uid
     });
-    
+
     return created(request, { success: true, id: documentId });
   } catch (error) {
     return serverError(request, error);
@@ -415,9 +473,18 @@ __name(uploadHandler, "uploadHandler");
 
 async function downloadHandler(request, env, fileName) {
   try {
-    if (!fileName || !fileName.endsWith(".pdf")) return badRequest(request, "Nom de fichier invalide.");
+    if (
+      !fileName ||
+      !fileName.endsWith(".pdf") ||
+      fileName.includes("/") ||
+      fileName.includes("..")
+    ) {
+      return badRequest(request, "Nom de fichier invalide.");
+    }
+
     const object = await env.MON_BUCKET.get(fileName);
     if (!object) return notFound(request, "Document introuvable.");
+
     const headers = new Headers(getCorsHeaders(request));
     object.writeHttpMetadata(headers);
     headers.set("Content-Type", object.httpMetadata?.contentType || "application/pdf");
@@ -433,9 +500,8 @@ __name(downloadHandler, "downloadHandler");
 // ====================================================================
 // 7. GESTION DU PANIER & DE L'ACCÈS
 // ====================================================================
-async function getPanierHandler(request, env) {
+async function getPanierHandler(request, env, user) {
   try {
-    const user = await verifyFirebaseToken(request);
     const result = await env.DB.prepare(
       `SELECT achats FROM paniers WHERE userId = ?`
     ).bind(user.uid).first();
@@ -447,17 +513,26 @@ async function getPanierHandler(request, env) {
 }
 __name(getPanierHandler, "getPanierHandler");
 
-async function savePanierHandler(request, env) {
+async function savePanierHandler(request, env, user) {
   try {
-    const user = await verifyFirebaseToken(request);
-    const body = await request.json();
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return badRequest(request, "Format de requête invalide.");
+    }
+
     if (!body || typeof body !== "object") return badRequest(request, "Données invalides.");
-    if (typeof body.achats !== "object") return badRequest(request, "Panier invalide.");
+    if (!body.achats || typeof body.achats !== "object" || Array.isArray(body.achats)) {
+      return badRequest(request, "Panier invalide.");
+    }
+
     await env.DB.prepare(
       `INSERT INTO paniers (userId, achats) VALUES (?, ?)
        ON CONFLICT(userId) DO UPDATE SET achats = excluded.achats`
     ).bind(user.uid, JSON.stringify(body.achats)).run();
-    return success(request, { success: true, message: "Panier mis à jour" });
+
+    return success(request, { success: true, message: "Panier mis à jour." });
   } catch (error) {
     return serverError(request, error);
   }
@@ -466,31 +541,53 @@ __name(savePanierHandler, "savePanierHandler");
 
 async function grantAccessHandler(request, env) {
   try {
-    const body = await request.json();
-    const docId = body.docId;
-    let userId;
     const serverKey = request.headers.get("x-server-key");
-    if (serverKey && serverKey === env.S2S_SECRET_KEY) {
-      if (!body.userId) return badRequest(request, "userId manquant.");
+    const isValidServerKey =
+      typeof env.S2S_SECRET_KEY === "string" &&
+      env.S2S_SECRET_KEY.length > 0 &&
+      serverKey === env.S2S_SECRET_KEY;
+
+    let authenticatedUser = null;
+    if (!isValidServerKey) {
+      authenticatedUser = await verifyFirebaseToken(request);
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return badRequest(request, "Format de requête invalide.");
+    }
+
+    const docId = body?.docId;
+    if (!docId || typeof docId !== "string") return badRequest(request, "Identifiant du document manquant.");
+
+    let userId;
+    if (isValidServerKey) {
+      if (!body.userId || typeof body.userId !== "string") {
+        return badRequest(request, "Identifiant utilisateur manquant.");
+      }
       userId = body.userId;
     } else {
-      const user = await verifyFirebaseToken(request);
-      userId = user.uid;
+      userId = authenticatedUser.uid;
     }
-    if (!docId) return badRequest(request, "docId manquant.");
+
     const result = await env.DB.prepare(
       `SELECT achats FROM paniers WHERE userId = ?`
     ).bind(userId).first();
     const achats = result?.achats ? JSON.parse(result.achats) : {};
+
     achats[docId] = {
-      purchaseDate: (new Date()).toISOString(),
+      purchaseDate: new Date().toISOString(),
       expiresAt: addMonths(CONFIG.ACCESS_DURATION_MONTHS),
-      paymentMethod: serverKey ? "server" : "firebase"
+      paymentMethod: isValidServerKey ? "server" : "firebase"
     };
+
     await env.DB.prepare(
       `INSERT INTO paniers (userId, achats) VALUES (?, ?)
        ON CONFLICT(userId) DO UPDATE SET achats = excluded.achats`
     ).bind(userId, JSON.stringify(achats)).run();
+
     return success(request, { success: true, expiresAt: achats[docId].expiresAt });
   } catch (error) {
     return serverError(request, error);
@@ -501,38 +598,33 @@ __name(grantAccessHandler, "grantAccessHandler");
 // ====================================================================
 // 8. LOGIQUE PAIEMENT ORANGE MONEY PDF : POST /api/pay-and-distribute
 // ====================================================================
-async function initiatePdfPaymentHandler(request, env) {
+async function initiatePdfPaymentHandler(request, env, user) {
   try {
     if (!env.ORANGE_MERCHANT_KEY) {
-      return serverError(request, new Error("ORANGE_MERCHANT_KEY manquante dans la configuration."));
+      throw new Error("ORANGE_MERCHANT_KEY manquante dans la configuration.");
     }
 
-    const user = await verifyFirebaseToken(request);
-    if (!user || !user.uid) {
-      return badRequest(request, "Utilisateur non authentifié.");
-    }
-    
     let body;
     try {
       body = await request.json();
     } catch (e) {
-      return badRequest(request, "Format de requête invalide (JSON attendu).");
+      return badRequest(request, "Format de requête invalide.");
     }
-    
-    const docId = body.docId;
-    if (!docId) return badRequest(request, "docId manquant.");
 
-    const doc = await getDocument(env, docId); 
+    const docId = body?.docId;
+    if (!docId || typeof docId !== "string") return badRequest(request, "Identifiant du document manquant.");
+
+    const doc = await getDocument(env, docId);
     if (!doc) return notFound(request, "Document introuvable.");
-    if (doc.type !== "payant") return badRequest(request, "Ce document n'est pas payant.");
+    if (doc.type !== "payant") return badRequest(request, "Ce document est gratuit.");
 
     const rawPrice = doc.brutPrice || doc.price;
-    if (!rawPrice) return badRequest(request, "Prix non défini dans la base de données.");
+    if (!rawPrice) return badRequest(request, "Tarif du document non configuré.");
 
-    const cleanPriceString = String(rawPrice).replace(/[^0-9]/g, '');
+    const cleanPriceString = String(rawPrice).replace(/[^0-9]/g, "");
     const price = Number(cleanPriceString);
 
-    if (isNaN(price) || price <= 0) return badRequest(request, "Prix du document invalide.");
+    if (isNaN(price) || price <= 0) return badRequest(request, "Tarif du document invalide.");
 
     const accessToken = await getOrangeAccessToken(env);
     const order_id = `PDF_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
@@ -571,25 +663,22 @@ async function initiatePdfPaymentHandler(request, env) {
         type: "pdf"
       });
 
-      // Stockage de l'ordre en statut 'pending'
       await env.DB.prepare(
         "INSERT OR REPLACE INTO payments (token, status, invoice_url, raw_data) VALUES (?, ?, ?, ?)"
       ).bind(order_id, "pending", data.payment_url || "", rawMetadata).run();
 
       return success(request, {
         success: true,
-        message: "Facture Orange Money générée avec succès.",
+        message: "Facture générée avec succès.",
         invoice_url: data.payment_url,
         token: order_id,
         pay_token: data.pay_token
       });
     } else {
-      console.error("Erreur réponse Orange Money:", data);
-      return badRequest(request, "Échec de création du paiement Orange Money.");
+      console.error("[ORANGE_WEBPAY_REJECTED]", data);
+      return badRequest(request, "Impossible d'initialiser le paiement Mobile Money.");
     }
-
   } catch (error) {
-    console.error("Erreur initiatePdfPaymentHandler:", error);
     return serverError(request, error);
   }
 }
@@ -604,7 +693,6 @@ async function s2sPdfWebhookHandler(request, env) {
     const url = new URL(request.url);
     const contentType = request.headers.get("content-type") || "";
 
-    // Lecture résiliente du body (JSON, Form Data ou URL Params)
     try {
       if (contentType.includes("application/json")) {
         body = await request.json();
@@ -621,38 +709,46 @@ async function s2sPdfWebhookHandler(request, env) {
         }
       }
     } catch (e) {
-      console.error("Erreur lors du parsing du webhook Orange:", e);
+      console.error("[WEBHOOK_PARSE_ERROR]", e);
     }
 
-    const notif_token = body.notif_token || body.notifToken || url.searchParams.get("notif_token") || "";
-    const order_id = body.order_id || body.orderId || body.token || url.searchParams.get("order_id") || "";
-    const txnid = body.txnid || body.txn_id || body.transaction_id || "";
-    const rawStatus = (body.status || body.state || "").toUpperCase();
+    const notif_token = String(body.notif_token || body.notifToken || url.searchParams.get("notif_token") || "").trim();
+    const order_id = String(body.order_id || body.orderId || body.token || url.searchParams.get("order_id") || "").trim();
+    const txnid = String(body.txnid || body.txn_id || body.transaction_id || "").trim();
+    const rawStatus = String(body.status || body.state || "").toUpperCase();
 
     if (!notif_token && !order_id) {
-      return json(request, { error: "Identifiant de transaction manquant" }, 400);
+      return badRequest(request, "Identifiant de transaction manquant.");
     }
 
-    // Recherche du paiement correspondant dans D1
     const { results } = await env.DB.prepare(
       "SELECT * FROM payments WHERE json_extract(raw_data, '$.notif_token') = ? OR token = ?"
     ).bind(notif_token, order_id).all();
 
     if (!results || results.length === 0) {
-      return json(request, { error: "Paiement non trouvé" }, 404);
+      return notFound(request, "Transaction introuvable.");
     }
 
     const payment = results[0];
-    const rawParsed = JSON.parse(payment.raw_data || "{}");
+    let rawParsed = {};
+    try {
+      rawParsed = JSON.parse(payment.raw_data || "{}");
+    } catch (e) {
+      console.error("[PAYMENT_METADATA_CORRUPTED]", payment.token);
+    }
+
+    // Vérification du jeton de notification secret s'il est enregistré
+    if (rawParsed.notif_token && notif_token && rawParsed.notif_token !== notif_token) {
+      return forbidden(request, "Signature de notification invalide.");
+    }
 
     const isSuccessStatus = ["SUCCESS", "SUCCESSFUL", "COMPLETED", "200", "00"].includes(rawStatus);
     const isFailedStatus = ["FAILED", "EXPIRED", "CANCELLED", "REFUNDED"].includes(rawStatus);
 
-    if (payment.status !== 'completed' && isSuccessStatus) {
+    if (payment.status !== "completed" && isSuccessStatus) {
       let verified = false;
       let finalReceiptUrl = txnid || payment.invoice_url;
 
-      // Vérification auprès de l'API Status d'Orange Money Mali
       try {
         const accessToken = await getOrangeAccessToken(env);
         const statusResponse = await fetch(ORANGE_STATUS_API, {
@@ -678,17 +774,15 @@ async function s2sPdfWebhookHandler(request, env) {
           }
         }
       } catch (authErr) {
-        console.warn("API Status non joignable, validation via Webhook direct :", authErr);
-        verified = true; // Validation de secours si l'API Status d'Orange est temporairement indisponible
+        console.warn("[ORANGE_STATUS_UNREACHABLE] Validation via webhook direct :", authErr?.message);
+        verified = true;
       }
 
       if (verified) {
-        // 1. Mise à jour de la table payments
         const updateResult = await env.DB.prepare(
           "UPDATE payments SET status = 'completed', invoice_url = ? WHERE token = ? AND status != 'completed'"
         ).bind(finalReceiptUrl, payment.token).run();
 
-        // 2. Déblocage de l'accès au PDF dans le panier
         if (updateResult.success && updateResult.meta && updateResult.meta.changes > 0) {
           const userId = rawParsed.userId;
           const docId = rawParsed.docId;
@@ -717,34 +811,36 @@ async function s2sPdfWebhookHandler(request, env) {
       await env.DB.prepare("UPDATE payments SET status = 'failed' WHERE token = ?").bind(payment.token).run();
     }
 
-    return json(request, { success: true, message: "Notification enregistrée avec succès" }, 200);
-
+    return success(request, { success: true, message: "Notification enregistrée." });
   } catch (error) {
-    console.error("Erreur S2S PDF Webhook Orange:", error);
     return serverError(request, error);
   }
 }
 __name(s2sPdfWebhookHandler, "s2sPdfWebhookHandler");
 
 // ====================================================================
-// 10. CLÉ DU DOCUMENT ET TABLEAU DE BORD AUTEUR (AVEC ACCÈS ADMIN GLOBAL)
+// 10. CLÉ DU DOCUMENT ET TABLEAU DE BORD AUTEUR / ADMIN
 // ====================================================================
-async function getDocumentKeyHandler(request, env, docId) {
+async function getDocumentKeyHandler(request, env, docId, user) {
   try {
-    const user = await verifyFirebaseToken(request);
+    if (!docId) return badRequest(request, "Identifiant du document manquant.");
+
     const doc = await getDocument(env, docId);
     if (!doc) return notFound(request, "Document introuvable.");
-    if (doc.type === "payant") {
+
+    if (doc.type === "payant" && !isAdminUser(user)) {
       const result = await env.DB.prepare(
         `SELECT achats FROM paniers WHERE userId = ?`
       ).bind(user.uid).first();
       const achats = result?.achats ? JSON.parse(result.achats) : {};
       const access = achats[docId];
-      if (!access) return forbidden(request, "Accès refusé.");
+      if (!access) return forbidden(request, "Accès refusé à ce document.");
+
       const now = new Date();
       const expiry = new Date(access.expiresAt);
-      if (expiry < now) return forbidden(request, "Accès expiré.");
+      if (expiry < now) return forbidden(request, "Votre accès à ce document a expiré.");
     }
+
     const key = await decryptDocumentKey(doc.encryptedKey, env.APP_SECRET_KEY);
     return success(request, { key, algorithm: "AES-GCM" });
   } catch (error) {
@@ -753,12 +849,13 @@ async function getDocumentKeyHandler(request, env, docId) {
 }
 __name(getDocumentKeyHandler, "getDocumentKeyHandler");
 
-async function getAuthorDashboardHandler(request, env) {
+async function getAuthorDashboardHandler(request, env, user, forceAdminView = false) {
   try {
-    const user = await verifyFirebaseToken(request);
     const isAdmin = isAdminUser(user);
+    if (forceAdminView && !isAdmin) {
+      return forbidden(request, "Accès refusé. Réservé aux administrateurs.");
+    }
 
-    // Les admins voient les documents de TOUS les auteurs ; un auteur ne voit que les siens
     const { results: authorDocs } = isAdmin
       ? await env.DB.prepare(
           `SELECT id, title, author, brutPrice, price, secretAuthorPhone, secretMobileMoneyOperator, userId FROM documents`
@@ -780,8 +877,11 @@ async function getAuthorDashboardHandler(request, env) {
     }
 
     const authorPhone = isAdmin ? "Tous les auteurs (Vue Admin)" : authorDocs[0].secretAuthorPhone;
-    const docIds = authorDocs.map(d => d.id);
-    const docMap = authorDocs.reduce((acc, d) => { acc[d.id] = d; return acc; }, {});
+    const docIds = authorDocs.map((d) => d.id);
+    const docMap = authorDocs.reduce((acc, d) => {
+      acc[d.id] = d;
+      return acc;
+    }, {});
 
     const { results: allPaniers } = await env.DB.prepare(`SELECT achats FROM paniers`).all();
 
@@ -792,66 +892,65 @@ async function getAuthorDashboardHandler(request, env) {
 
     const now = new Date();
     let lastResetDate;
-    
+
     if (now.getUTCDate() >= 15) {
-        lastResetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 15, 0, 0, 0));
+      lastResetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 15, 0, 0, 0));
     } else {
-        lastResetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15, 0, 0, 0));
+      lastResetDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 15, 0, 0, 0));
     }
 
     const resetTimestamp = lastResetDate.getTime();
 
-    allPaniers.forEach(panier => {
+    allPaniers.forEach((panier) => {
       if (!panier.achats) return;
-      
+
       let achats;
       try {
-        achats = typeof panier.achats === 'string' ? JSON.parse(panier.achats) : panier.achats;
+        achats = typeof panier.achats === "string" ? JSON.parse(panier.achats) : panier.achats;
       } catch (e) {
         return;
       }
-      
+
       for (const [docId, data] of Object.entries(achats)) {
         if (docIds.includes(docId)) {
           const purchaseTime = new Date(data.purchaseDate).getTime();
-          
+
           if (!isNaN(purchaseTime) && purchaseTime >= resetTimestamp) {
-              const doc = docMap[docId];
-              const rawPrice = doc.brutPrice || doc.price;
-              
-              const price = Number(String(rawPrice).replace(/[^0-9]/g, '')) || 0;
-              const partAuteur = Math.round(price * 0.58); 
+            const doc = docMap[docId];
+            const rawPrice = doc.brutPrice || doc.price;
 
-              totalSales++;
-              totalRevenue += partAuteur;
+            const price = Number(String(rawPrice).replace(/[^0-9]/g, "")) || 0;
+            const partAuteur = Math.round(price * 0.58);
 
-              // Agrégation par auteur pour la vue administrateur
-              const keyAuthor = doc.secretAuthorPhone || doc.userId || "Inconnu";
-              if (!authorsMap[keyAuthor]) {
-                authorsMap[keyAuthor] = {
-                  authorName: doc.author || "Auteur",
-                  phone: doc.secretAuthorPhone || "Non renseigné",
-                  operator: doc.secretMobileMoneyOperator || "Non renseigné",
-                  userId: doc.userId,
-                  salesCount: 0,
-                  totalRevenue: 0
-                };
-              }
-              authorsMap[keyAuthor].salesCount++;
-              authorsMap[keyAuthor].totalRevenue += partAuteur;
+            totalSales++;
+            totalRevenue += partAuteur;
 
-              invoices.push({
-                docTitle: isAdmin
-                  ? `${doc.title} (${doc.author || "Auteur"} - ${doc.secretAuthorPhone || "N/A"})`
-                  : doc.title,
-                authorName: doc.author,
-                authorPhone: doc.secretAuthorPhone,
-                operator: doc.secretMobileMoneyOperator,
-                purchaseDate: data.purchaseDate,
-                revenue: partAuteur,
-                paymentMethod: data.paymentMethod,
-                receipt_url: data.receipt_url
-              });
+            const keyAuthor = doc.secretAuthorPhone || doc.userId || "Inconnu";
+            if (!authorsMap[keyAuthor]) {
+              authorsMap[keyAuthor] = {
+                authorName: doc.author || "Auteur",
+                phone: doc.secretAuthorPhone || "Non renseigné",
+                operator: doc.secretMobileMoneyOperator || "Non renseigné",
+                userId: doc.userId,
+                salesCount: 0,
+                totalRevenue: 0
+              };
+            }
+            authorsMap[keyAuthor].salesCount++;
+            authorsMap[keyAuthor].totalRevenue += partAuteur;
+
+            invoices.push({
+              docTitle: isAdmin
+                ? `${doc.title} (${doc.author || "Auteur"} - ${doc.secretAuthorPhone || "N/A"})`
+                : doc.title,
+              authorName: doc.author,
+              authorPhone: doc.secretAuthorPhone,
+              operator: doc.secretMobileMoneyOperator,
+              purchaseDate: data.purchaseDate,
+              revenue: partAuteur,
+              paymentMethod: data.paymentMethod,
+              receipt_url: data.receipt_url
+            });
           }
         }
       }
@@ -860,14 +959,14 @@ async function getAuthorDashboardHandler(request, env) {
     invoices.sort((a, b) => new Date(b.purchaseDate) - new Date(a.purchaseDate));
     const authorsSummary = Object.values(authorsMap).sort((a, b) => b.totalRevenue - a.totalRevenue);
 
-    return success(request, { 
-        isAdmin,
-        totalRevenue, 
-        totalSales, 
-        invoices,
-        authorsSummary,
-        phone: authorPhone,
-        periodStart: lastResetDate.toISOString()
+    return success(request, {
+      isAdmin,
+      totalRevenue,
+      totalSales,
+      invoices,
+      authorsSummary,
+      phone: authorPhone,
+      periodStart: lastResetDate.toISOString()
     });
   } catch (error) {
     return serverError(request, error);
@@ -902,14 +1001,12 @@ async function processMonthlyPayouts(env) {
     const now = new Date();
     const nowIso = now.toISOString();
 
-    // 1. Fenêtre QUOTIDIENNE (Journée UTC en cours : 00:00:00 -> 23:59:59)
     const dailyStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
     const dailyEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
     const dailyStartTime = dailyStart.getTime();
     const dailyEndTime = dailyEnd.getTime();
-    const dailyPeriodKey = dailyStart.toISOString().slice(0, 10); // ex: "2026-11-16"
+    const dailyPeriodKey = dailyStart.toISOString().slice(0, 10);
 
-    // 2. Fenêtre MENSUELLE (Cycle actif du 16 au 15 à 23h59)
     let monthlyStart;
     let monthlyEnd;
     if (now.getUTCDate() >= 16) {
@@ -926,11 +1023,11 @@ async function processMonthlyPayouts(env) {
     const { results: allDocs } = await env.DB.prepare(
       `SELECT id, author, brutPrice, price, secretAuthorPhone, secretMobileMoneyOperator FROM documents`
     ).all();
-    
+
     const docMap = {};
-    allDocs.forEach(d => {
+    allDocs.forEach((d) => {
       const rawPrice = d.brutPrice || d.price;
-      const price = Number(String(rawPrice).replace(/[^0-9]/g, '')) || 0;
+      const price = Number(String(rawPrice).replace(/[^0-9]/g, "")) || 0;
       docMap[d.id] = {
         phone: d.secretAuthorPhone,
         authorName: d.author || "Auteur",
@@ -943,16 +1040,16 @@ async function processMonthlyPayouts(env) {
     const dailyPayouts = {};
     const monthlyPayouts = {};
 
-    allPaniers.forEach(panier => {
+    allPaniers.forEach((panier) => {
       if (!panier.achats) return;
-      
+
       let achats;
       try {
-        achats = typeof panier.achats === 'string' ? JSON.parse(panier.achats) : panier.achats;
+        achats = typeof panier.achats === "string" ? JSON.parse(panier.achats) : panier.achats;
       } catch (e) {
         return;
       }
-      
+
       for (const [docId, data] of Object.entries(achats)) {
         const purchaseTime = new Date(data.purchaseDate).getTime();
         if (isNaN(purchaseTime)) continue;
@@ -960,7 +1057,6 @@ async function processMonthlyPayouts(env) {
         const docInfo = docMap[docId];
         if (!docInfo || !docInfo.phone || docInfo.partAuteur <= 0) continue;
 
-        // Cumul Quotidien
         if (purchaseTime >= dailyStartTime && purchaseTime <= dailyEndTime) {
           if (!dailyPayouts[docInfo.phone]) {
             dailyPayouts[docInfo.phone] = {
@@ -975,7 +1071,6 @@ async function processMonthlyPayouts(env) {
           dailyPayouts[docInfo.phone].amount += docInfo.partAuteur;
         }
 
-        // Cumul Mensuel (cycle 16 -> 15)
         if (purchaseTime >= monthlyStartTime && purchaseTime <= monthlyEndTime) {
           if (!monthlyPayouts[docInfo.phone]) {
             monthlyPayouts[docInfo.phone] = {
@@ -992,7 +1087,6 @@ async function processMonthlyPayouts(env) {
       }
     });
 
-    // Écriture dans la table D1 author_payouts (Quotidien)
     for (const item of Object.values(dailyPayouts)) {
       if (item.amount > 0) {
         const rowId = `daily_${dailyPeriodKey}_${item.phone}`;
@@ -1012,7 +1106,6 @@ async function processMonthlyPayouts(env) {
       }
     }
 
-    // Écriture dans la table D1 author_payouts (Mensuel)
     for (const item of Object.values(monthlyPayouts)) {
       if (item.amount > 0) {
         const rowId = `monthly_${monthlyPeriodKey}_${item.phone}`;
@@ -1032,26 +1125,24 @@ async function processMonthlyPayouts(env) {
       }
     }
 
-    console.log(`Reversements D1 enregistrés avec succès (daily: ${dailyPeriodKey}, monthly: ${monthlyPeriodKey}).`);
+    console.log(`[CRON_PAYOUTS_OK] daily=${dailyPeriodKey}, monthly=${monthlyPeriodKey}`);
   } catch (err) {
-    console.error("Erreur fatale dans la tâche CRON de paiement :", err);
+    console.error("[CRON_PAYOUTS_ERROR]", err);
   }
 }
 __name(processMonthlyPayouts, "processMonthlyPayouts");
 
-// Route sécurisée pour consulter la table D1 des reversements (Admins uniquement)
-async function getAdminPayoutsHandler(request, env) {
+async function getAdminPayoutsHandler(request, env, user) {
   try {
-    const user = await verifyFirebaseToken(request);
     if (!isAdminUser(user)) {
-      return forbidden(request, "Accès refusé. Réservé aux administrateurs autorisés.");
+      return forbidden(request, "Accès refusé. Réservé aux administrateurs.");
     }
 
     await ensurePayoutsTable(env);
 
     const url = new URL(request.url);
-    const typeFilter = url.searchParams.get("type");     // 'daily' ou 'monthly' (optionnel)
-    const periodFilter = url.searchParams.get("period"); // ex: '2026-11-16' (optionnel)
+    const typeFilter = url.searchParams.get("type");
+    const periodFilter = url.searchParams.get("period");
 
     let query = `SELECT * FROM author_payouts`;
     const conditions = [];
@@ -1079,7 +1170,6 @@ async function getAdminPayoutsHandler(request, env) {
 
     return success(request, {
       success: true,
-      admin: user.email,
       count: results.length,
       payouts: results
     });
@@ -1090,7 +1180,7 @@ async function getAdminPayoutsHandler(request, env) {
 __name(getAdminPayoutsHandler, "getAdminPayoutsHandler");
 
 // ====================================================================
-// 12. ROUTEUR PRINCIPAL D'EXPORTATION WORKER
+// 12. ROUTEUR PRINCIPAL AVEC GARDE D'AUTHENTIFICATION CENTRALISÉE
 // ====================================================================
 export default {
   async fetch(request, env, ctx) {
@@ -1103,44 +1193,64 @@ export default {
         return handleOptions(request);
       }
 
+      // 1. Routes publiques / Webhook externe
       if (method === "POST" && path === "/s2s/pdf") {
         return await s2sPdfWebhookHandler(request, env);
       }
-
       if (method === "GET" && path === "/documents") {
-        return getDocumentsHandler(request, env);
-      }
-      if (method === "POST" && path === "/api/upload") {
-        return uploadHandler(request, env);
+        return await getDocumentsHandler(request, env);
       }
       if (method === "GET" && path.startsWith("/api/download/")) {
-        const fileName = path.replace("/api/download/", "");
-        return downloadHandler(request, env, fileName);
+        const fileName = decodeURIComponent(path.replace("/api/download/", ""));
+        return await downloadHandler(request, env, fileName);
       }
-      if (method === "GET" && path === "/panier") {
-        return getPanierHandler(request, env);
-      }
-      if (method === "POST" && path === "/panier") {
-        return savePanierHandler(request, env);
-      }
+
+      // 2. Route hybride (Clé serveur S2S OU Jeton Firebase)
       if (method === "POST" && path === "/api/grant-access") {
-        return grantAccessHandler(request, env);
+        return await grantAccessHandler(request, env);
       }
-      if (method === "POST" && path === "/api/pay-and-distribute") {
-        return await initiatePdfPaymentHandler(request, env);
-      }
-      if (method === "GET" && path.startsWith("/api/get-key/")) {
-        const docId = path.replace("/api/get-key/", "");
-        return getDocumentKeyHandler(request, env, docId);
-      }
-      if (method === "GET" && path === "/api/author-dashboard") {
-        return await getAuthorDashboardHandler(request, env);
-      }
-      if (method === "GET" && path === "/api/admin/authors-dashboard") {
-        return await getAuthorDashboardHandler(request, env);
-      }
-      if (method === "GET" && path === "/api/admin/payouts") {
-        return await getAdminPayoutsHandler(request, env);
+
+      // 3. Vérification systématique du jeton Firebase pour toutes les routes sensibles
+      if (
+        path === "/api/upload" ||
+        path === "/panier" ||
+        path === "/api/pay-and-distribute" ||
+        path.startsWith("/api/get-key/") ||
+        path === "/api/author-dashboard" ||
+        path.startsWith("/api/admin/")
+      ) {
+        const user = await verifyFirebaseToken(request);
+
+        // Garde Administrateur systématique sur /api/admin/*
+        if (path.startsWith("/api/admin/") && !isAdminUser(user)) {
+          return forbidden(request, "Accès refusé. Privilèges administrateur requis.");
+        }
+
+        if (method === "POST" && path === "/api/upload") {
+          return await uploadHandler(request, env, user);
+        }
+        if (method === "GET" && path === "/panier") {
+          return await getPanierHandler(request, env, user);
+        }
+        if (method === "POST" && path === "/panier") {
+          return await savePanierHandler(request, env, user);
+        }
+        if (method === "POST" && path === "/api/pay-and-distribute") {
+          return await initiatePdfPaymentHandler(request, env, user);
+        }
+        if (method === "GET" && path.startsWith("/api/get-key/")) {
+          const docId = decodeURIComponent(path.replace("/api/get-key/", ""));
+          return await getDocumentKeyHandler(request, env, docId, user);
+        }
+        if (method === "GET" && path === "/api/author-dashboard") {
+          return await getAuthorDashboardHandler(request, env, user, false);
+        }
+        if (method === "GET" && path === "/api/admin/authors-dashboard") {
+          return await getAuthorDashboardHandler(request, env, user, true);
+        }
+        if (method === "GET" && path === "/api/admin/payouts") {
+          return await getAdminPayoutsHandler(request, env, user);
+        }
       }
 
       return notFound(request, "Route introuvable.");
