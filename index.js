@@ -14,6 +14,12 @@ var CONFIG = {
   PDF_MIME_TYPE: "application/pdf"
 };
 
+// Comptes administrateurs autorisés à voir tous les auteurs et les reversements
+var ADMIN_EMAILS = [
+  "ladjitraore5995@gmail.com",
+  "fatmariamtraore95@gmail.com"
+];
+
 // Endpoints Orange Money WebPayment API - Production Mali (/ml/)
 var ORANGE_OAUTH_API = "https://api.orange.com/oauth/v3/token";
 var ORANGE_WEBPAY_API = "https://api.orange.com/orange-money-webpay/ml/v1/webpayment";
@@ -269,6 +275,15 @@ async function verifyFirebaseToken(request) {
   };
 }
 __name(verifyFirebaseToken, "verifyFirebaseToken");
+
+function isAdminUser(user) {
+  return Boolean(
+    user &&
+    user.email &&
+    ADMIN_EMAILS.includes(String(user.email).toLowerCase().trim())
+  );
+}
+__name(isAdminUser, "isAdminUser");
 
 // ====================================================================
 // 5. SERVICES ORANGE MONEY
@@ -712,7 +727,7 @@ async function s2sPdfWebhookHandler(request, env) {
 __name(s2sPdfWebhookHandler, "s2sPdfWebhookHandler");
 
 // ====================================================================
-// 10. CLÉ DU DOCUMENT ET TABLEAU DE BORD AUTEUR
+// 10. CLÉ DU DOCUMENT ET TABLEAU DE BORD AUTEUR (AVEC ACCÈS ADMIN GLOBAL)
 // ====================================================================
 async function getDocumentKeyHandler(request, env, docId) {
   try {
@@ -741,16 +756,30 @@ __name(getDocumentKeyHandler, "getDocumentKeyHandler");
 async function getAuthorDashboardHandler(request, env) {
   try {
     const user = await verifyFirebaseToken(request);
+    const isAdmin = isAdminUser(user);
 
-    const { results: authorDocs } = await env.DB.prepare(
-      `SELECT id, title, brutPrice, price, secretAuthorPhone FROM documents WHERE userId = ?`
-    ).bind(user.uid).all();
+    // Les admins voient les documents de TOUS les auteurs ; un auteur ne voit que les siens
+    const { results: authorDocs } = isAdmin
+      ? await env.DB.prepare(
+          `SELECT id, title, author, brutPrice, price, secretAuthorPhone, secretMobileMoneyOperator, userId FROM documents`
+        ).all()
+      : await env.DB.prepare(
+          `SELECT id, title, author, brutPrice, price, secretAuthorPhone, secretMobileMoneyOperator, userId FROM documents WHERE userId = ?`
+        ).bind(user.uid).all();
 
     if (!authorDocs || authorDocs.length === 0) {
-      return success(request, { totalRevenue: 0, totalSales: 0, invoices: [], phone: null, periodStart: null });
+      return success(request, {
+        isAdmin,
+        totalRevenue: 0,
+        totalSales: 0,
+        invoices: [],
+        authorsSummary: [],
+        phone: isAdmin ? "Tous les auteurs (Vue Admin)" : null,
+        periodStart: null
+      });
     }
 
-    const authorPhone = authorDocs[0].secretAuthorPhone; 
+    const authorPhone = isAdmin ? "Tous les auteurs (Vue Admin)" : authorDocs[0].secretAuthorPhone;
     const docIds = authorDocs.map(d => d.id);
     const docMap = authorDocs.reduce((acc, d) => { acc[d.id] = d; return acc; }, {});
 
@@ -759,6 +788,7 @@ async function getAuthorDashboardHandler(request, env) {
     let totalRevenue = 0;
     let totalSales = 0;
     const invoices = [];
+    const authorsMap = {};
 
     const now = new Date();
     let lastResetDate;
@@ -795,8 +825,28 @@ async function getAuthorDashboardHandler(request, env) {
               totalSales++;
               totalRevenue += partAuteur;
 
+              // Agrégation par auteur pour la vue administrateur
+              const keyAuthor = doc.secretAuthorPhone || doc.userId || "Inconnu";
+              if (!authorsMap[keyAuthor]) {
+                authorsMap[keyAuthor] = {
+                  authorName: doc.author || "Auteur",
+                  phone: doc.secretAuthorPhone || "Non renseigné",
+                  operator: doc.secretMobileMoneyOperator || "Non renseigné",
+                  userId: doc.userId,
+                  salesCount: 0,
+                  totalRevenue: 0
+                };
+              }
+              authorsMap[keyAuthor].salesCount++;
+              authorsMap[keyAuthor].totalRevenue += partAuteur;
+
               invoices.push({
-                docTitle: doc.title,
+                docTitle: isAdmin
+                  ? `${doc.title} (${doc.author || "Auteur"} - ${doc.secretAuthorPhone || "N/A"})`
+                  : doc.title,
+                authorName: doc.author,
+                authorPhone: doc.secretAuthorPhone,
+                operator: doc.secretMobileMoneyOperator,
                 purchaseDate: data.purchaseDate,
                 revenue: partAuteur,
                 paymentMethod: data.paymentMethod,
@@ -808,11 +858,14 @@ async function getAuthorDashboardHandler(request, env) {
     });
 
     invoices.sort((a, b) => new Date(b.purchaseDate) - new Date(a.purchaseDate));
+    const authorsSummary = Object.values(authorsMap).sort((a, b) => b.totalRevenue - a.totalRevenue);
 
     return success(request, { 
+        isAdmin,
         totalRevenue, 
         totalSales, 
-        invoices, 
+        invoices,
+        authorsSummary,
         phone: authorPhone,
         periodStart: lastResetDate.toISOString()
     });
@@ -823,27 +876,55 @@ async function getAuthorDashboardHandler(request, env) {
 __name(getAuthorDashboardHandler, "getAuthorDashboardHandler");
 
 // ====================================================================
-// 11. TÂCHE AUTOMATIQUE CRON (REVERSEMENT AUX AUTEURS)
+// 11. TÂCHE AUTOMATIQUE CRON (ÉCRITURE D1 QUOTIDIENNE & MENSUELLE) + ROUTE ADMIN
 // ====================================================================
+async function ensurePayoutsTable(env) {
+  await env.DB.prepare(`
+    CREATE TABLE IF NOT EXISTS author_payouts (
+      id TEXT PRIMARY KEY,
+      period_type TEXT NOT NULL,
+      period_key TEXT NOT NULL,
+      author_phone TEXT NOT NULL,
+      author_name TEXT,
+      operator TEXT,
+      sales_count INTEGER DEFAULT 0,
+      total_amount INTEGER DEFAULT 0,
+      updated_at TEXT NOT NULL
+    )
+  `).run();
+}
+__name(ensurePayoutsTable, "ensurePayoutsTable");
+
 async function processMonthlyPayouts(env) {
   try {
-    const now = new Date();
-    
-    const endDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 15, 23, 59, 59));
-    
-    let startMonth = now.getUTCMonth() - 1;
-    let startYear = now.getUTCFullYear();
-    if (startMonth < 0) {
-      startMonth = 11;
-      startYear--;
-    }
-    const startDate = new Date(Date.UTC(startYear, startMonth, 16, 0, 0, 0));
+    await ensurePayoutsTable(env);
 
-    const startTime = startDate.getTime();
-    const endTime = endDate.getTime();
+    const now = new Date();
+    const nowIso = now.toISOString();
+
+    // 1. Fenêtre QUOTIDIENNE (Journée UTC en cours : 00:00:00 -> 23:59:59)
+    const dailyStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 0, 0, 0, 0));
+    const dailyEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), 23, 59, 59, 999));
+    const dailyStartTime = dailyStart.getTime();
+    const dailyEndTime = dailyEnd.getTime();
+    const dailyPeriodKey = dailyStart.toISOString().slice(0, 10); // ex: "2026-11-16"
+
+    // 2. Fenêtre MENSUELLE (Cycle actif du 16 au 15 à 23h59)
+    let monthlyStart;
+    let monthlyEnd;
+    if (now.getUTCDate() >= 16) {
+      monthlyStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 16, 0, 0, 0, 0));
+      monthlyEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 15, 23, 59, 59, 999));
+    } else {
+      monthlyStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - 1, 16, 0, 0, 0, 0));
+      monthlyEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 15, 23, 59, 59, 999));
+    }
+    const monthlyStartTime = monthlyStart.getTime();
+    const monthlyEndTime = monthlyEnd.getTime();
+    const monthlyPeriodKey = `${monthlyStart.toISOString().slice(0, 10)}_au_${monthlyEnd.toISOString().slice(0, 10)}`;
 
     const { results: allDocs } = await env.DB.prepare(
-      `SELECT id, brutPrice, price, secretAuthorPhone FROM documents`
+      `SELECT id, author, brutPrice, price, secretAuthorPhone, secretMobileMoneyOperator FROM documents`
     ).all();
     
     const docMap = {};
@@ -852,12 +933,15 @@ async function processMonthlyPayouts(env) {
       const price = Number(String(rawPrice).replace(/[^0-9]/g, '')) || 0;
       docMap[d.id] = {
         phone: d.secretAuthorPhone,
+        authorName: d.author || "Auteur",
+        operator: d.secretMobileMoneyOperator || "orange_money",
         partAuteur: Math.round(price * 0.58)
       };
     });
 
     const { results: allPaniers } = await env.DB.prepare(`SELECT achats FROM paniers`).all();
-    const payouts = {};
+    const dailyPayouts = {};
+    const monthlyPayouts = {};
 
     allPaniers.forEach(panier => {
       if (!panier.achats) return;
@@ -871,44 +955,139 @@ async function processMonthlyPayouts(env) {
       
       for (const [docId, data] of Object.entries(achats)) {
         const purchaseTime = new Date(data.purchaseDate).getTime();
-        
-        if (!isNaN(purchaseTime) && purchaseTime >= startTime && purchaseTime <= endTime) {
-          const docInfo = docMap[docId];
-          if (docInfo && docInfo.phone) {
-            if (!payouts[docInfo.phone]) payouts[docInfo.phone] = 0;
-            payouts[docInfo.phone] += docInfo.partAuteur;
+        if (isNaN(purchaseTime)) continue;
+
+        const docInfo = docMap[docId];
+        if (!docInfo || !docInfo.phone || docInfo.partAuteur <= 0) continue;
+
+        // Cumul Quotidien
+        if (purchaseTime >= dailyStartTime && purchaseTime <= dailyEndTime) {
+          if (!dailyPayouts[docInfo.phone]) {
+            dailyPayouts[docInfo.phone] = {
+              phone: docInfo.phone,
+              authorName: docInfo.authorName,
+              operator: docInfo.operator,
+              salesCount: 0,
+              amount: 0
+            };
           }
+          dailyPayouts[docInfo.phone].salesCount += 1;
+          dailyPayouts[docInfo.phone].amount += docInfo.partAuteur;
+        }
+
+        // Cumul Mensuel (cycle 16 -> 15)
+        if (purchaseTime >= monthlyStartTime && purchaseTime <= monthlyEndTime) {
+          if (!monthlyPayouts[docInfo.phone]) {
+            monthlyPayouts[docInfo.phone] = {
+              phone: docInfo.phone,
+              authorName: docInfo.authorName,
+              operator: docInfo.operator,
+              salesCount: 0,
+              amount: 0
+            };
+          }
+          monthlyPayouts[docInfo.phone].salesCount += 1;
+          monthlyPayouts[docInfo.phone].amount += docInfo.partAuteur;
         }
       }
     });
 
-    const payoutUrl = "https://api.ika-book.com/s2s/payout-authors"; 
-
-    const payoutPayload = Object.entries(payouts)
-        .map(([phone, amount]) => ({ phone, amount }))
-        .filter(p => p.amount > 0);
-
-    if (payoutPayload.length > 0) {
-       const response = await fetch(payoutUrl, {
-          method: "POST",
-          headers: { 
-            "Content-Type": "application/json",
-            "x-server-key": env.S2S_SECRET_KEY 
-          },
-          body: JSON.stringify({ payouts: payoutPayload })
-       });
-
-       if (!response.ok) {
-           console.error("Erreur lors de la requête de push manuel :", await response.text());
-       } else {
-           console.log("Paiements push initiés avec succès !");
-       }
+    // Écriture dans la table D1 author_payouts (Quotidien)
+    for (const item of Object.values(dailyPayouts)) {
+      if (item.amount > 0) {
+        const rowId = `daily_${dailyPeriodKey}_${item.phone}`;
+        await env.DB.prepare(`
+          INSERT INTO author_payouts (
+            id, period_type, period_key, author_phone, author_name, operator, sales_count, total_amount, updated_at
+          ) VALUES (?, 'daily', ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            author_name = excluded.author_name,
+            operator = excluded.operator,
+            sales_count = excluded.sales_count,
+            total_amount = excluded.total_amount,
+            updated_at = excluded.updated_at
+        `).bind(
+          rowId, dailyPeriodKey, item.phone, item.authorName, item.operator, item.salesCount, item.amount, nowIso
+        ).run();
+      }
     }
+
+    // Écriture dans la table D1 author_payouts (Mensuel)
+    for (const item of Object.values(monthlyPayouts)) {
+      if (item.amount > 0) {
+        const rowId = `monthly_${monthlyPeriodKey}_${item.phone}`;
+        await env.DB.prepare(`
+          INSERT INTO author_payouts (
+            id, period_type, period_key, author_phone, author_name, operator, sales_count, total_amount, updated_at
+          ) VALUES (?, 'monthly', ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(id) DO UPDATE SET
+            author_name = excluded.author_name,
+            operator = excluded.operator,
+            sales_count = excluded.sales_count,
+            total_amount = excluded.total_amount,
+            updated_at = excluded.updated_at
+        `).bind(
+          rowId, monthlyPeriodKey, item.phone, item.authorName, item.operator, item.salesCount, item.amount, nowIso
+        ).run();
+      }
+    }
+
+    console.log(`Reversements D1 enregistrés avec succès (daily: ${dailyPeriodKey}, monthly: ${monthlyPeriodKey}).`);
   } catch (err) {
     console.error("Erreur fatale dans la tâche CRON de paiement :", err);
   }
 }
 __name(processMonthlyPayouts, "processMonthlyPayouts");
+
+// Route sécurisée pour consulter la table D1 des reversements (Admins uniquement)
+async function getAdminPayoutsHandler(request, env) {
+  try {
+    const user = await verifyFirebaseToken(request);
+    if (!isAdminUser(user)) {
+      return forbidden(request, "Accès refusé. Réservé aux administrateurs autorisés.");
+    }
+
+    await ensurePayoutsTable(env);
+
+    const url = new URL(request.url);
+    const typeFilter = url.searchParams.get("type");     // 'daily' ou 'monthly' (optionnel)
+    const periodFilter = url.searchParams.get("period"); // ex: '2026-11-16' (optionnel)
+
+    let query = `SELECT * FROM author_payouts`;
+    const conditions = [];
+    const bindings = [];
+
+    if (typeFilter && ["daily", "monthly"].includes(typeFilter)) {
+      conditions.push(`period_type = ?`);
+      bindings.push(typeFilter);
+    }
+    if (periodFilter) {
+      conditions.push(`period_key = ?`);
+      bindings.push(periodFilter);
+    }
+
+    if (conditions.length > 0) {
+      query += ` WHERE ` + conditions.join(" AND ");
+    }
+    query += ` ORDER BY period_key DESC, total_amount DESC`;
+
+    const stmt = bindings.length > 0
+      ? env.DB.prepare(query).bind(...bindings)
+      : env.DB.prepare(query);
+
+    const { results } = await stmt.all();
+
+    return success(request, {
+      success: true,
+      admin: user.email,
+      count: results.length,
+      payouts: results
+    });
+  } catch (error) {
+    return serverError(request, error);
+  }
+}
+__name(getAdminPayoutsHandler, "getAdminPayoutsHandler");
 
 // ====================================================================
 // 12. ROUTEUR PRINCIPAL D'EXPORTATION WORKER
@@ -956,6 +1135,12 @@ export default {
       }
       if (method === "GET" && path === "/api/author-dashboard") {
         return await getAuthorDashboardHandler(request, env);
+      }
+      if (method === "GET" && path === "/api/admin/authors-dashboard") {
+        return await getAuthorDashboardHandler(request, env);
+      }
+      if (method === "GET" && path === "/api/admin/payouts") {
+        return await getAdminPayoutsHandler(request, env);
       }
 
       return notFound(request, "Route introuvable.");
