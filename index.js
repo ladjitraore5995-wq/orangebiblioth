@@ -11,7 +11,8 @@ var CONFIG = {
   ACCESS_DURATION_MONTHS: 9,
   MAX_DOCUMENTS: 50,
   MAX_FILE_SIZE: 100 * 1024 * 1024,
-  PDF_MIME_TYPE: "application/pdf"
+  PDF_MIME_TYPE: "application/pdf",
+  WORKER_MOUNT_PATH: "/w5"
 };
 
 // Comptes administrateurs autorisés à voir tous les auteurs et les reversements
@@ -35,6 +36,16 @@ var cachedJwks = null;
 var cachedJwksTime = 0;
 var encoder = new TextEncoder();
 var decoder = new TextDecoder();
+
+// Construit l'URL de base du Worker en conservant le préfixe /w5 si présent
+function getWorkerBaseUrl(request) {
+  const url = new URL(request.url);
+  const prefix = url.pathname === CONFIG.WORKER_MOUNT_PATH || url.pathname.startsWith(`${CONFIG.WORKER_MOUNT_PATH}/`)
+    ? CONFIG.WORKER_MOUNT_PATH
+    : "";
+  return `${url.origin}${prefix}`;
+}
+__name(getWorkerBaseUrl, "getWorkerBaseUrl");
 
 // ====================================================================
 // 2. CLASSES D'ERREURS & HELPER RESPONSES (FILTRAGE STRICT)
@@ -403,10 +414,10 @@ __name(saveDocument, "saveDocument");
 async function getDocumentsHandler(request, env) {
   try {
     const docs = await getDocuments(env);
-    const origin = new URL(request.url).origin;
+    const baseUrl = getWorkerBaseUrl(request);
     const response = docs.map((doc) => ({
       ...doc,
-      downloadUrl: `${origin}/api/download/${doc.fileName}`
+      downloadUrl: `${baseUrl}/api/download/${encodeURIComponent(doc.fileName)}`
     }));
     return success(request, response);
   } catch (error) {
@@ -477,6 +488,7 @@ async function downloadHandler(request, env, fileName) {
       !fileName ||
       !fileName.endsWith(".pdf") ||
       fileName.includes("/") ||
+      fileName.includes("\\") ||
       fileName.includes("..")
     ) {
       return badRequest(request, "Nom de fichier invalide.");
@@ -628,7 +640,7 @@ async function initiatePdfPaymentHandler(request, env, user) {
 
     const accessToken = await getOrangeAccessToken(env);
     const order_id = `PDF_${Date.now()}_${Math.floor(Math.random() * 10000)}`;
-    const url = new URL(request.url);
+    const baseUrl = getWorkerBaseUrl(request);
 
     // Envoi de la demande de paiement à Orange Money Mali (XOF)
     const payResponse = await fetch(ORANGE_WEBPAY_API, {
@@ -645,7 +657,7 @@ async function initiatePdfPaymentHandler(request, env, user) {
         amount: price,
         return_url: "https://www.ika-book.com/bibliotheque.html",
         cancel_url: "https://www.ika-book.com/bibliotheque.html",
-        notif_url: `${url.origin}/s2s/pdf`,
+        notif_url: `${baseUrl}/s2s/pdf`,
         lang: "fr",
         reference: "Ika-Book PDF"
       })
