@@ -1186,6 +1186,7 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
+      url.pathname = url.pathname.replace(/^\/w5(?=\/|$)/, '') || '/';
       const path = url.pathname;
       const method = request.method;
 
